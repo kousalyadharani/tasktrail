@@ -77,6 +77,15 @@ def submit(raw, db=None):
     con.execute("INSERT OR IGNORE INTO runs(id,email,status,created) VALUES(?,?,?,?)",(rid,raw,"queued",datetime.now(timezone.utc).isoformat())); con.commit(); con.close()
     return rid
 
+def resume_pending(db=None):
+    """Restart checkpointed work after a server process restart."""
+    db = DB if db is None else db
+    con=connect(db)
+    pending=[r[0] for r in con.execute("SELECT id FROM runs WHERE status IN ('queued','running')")]
+    con.close()
+    for rid in pending: threading.Thread(target=run_pipeline,args=(rid,db),daemon=True).start()
+    return len(pending)
+
 class Handler(BaseHTTPRequestHandler):
     def send_json(self, value, status=200):
         data=json.dumps(value).encode(); self.send_response(status); self.send_header("Content-Type","application/json"); self.send_header("Content-Length",str(len(data))); self.end_headers(); self.wfile.write(data)
@@ -88,6 +97,23 @@ class Handler(BaseHTTPRequestHandler):
         con=connect()
         if path=="/api/runs": rows=[dict(x) for x in con.execute("SELECT id,status,step,error,created FROM runs ORDER BY created DESC")]; con.close(); return self.send_json(rows)
         parts=path.strip('/').split('/')
+        if len(parts)==4 and parts[:2]==["api","runs"] and parts[3]=="events":
+            rid=parts[2]
+            try: last_id=int(self.headers.get("Last-Event-ID","0"))
+            except ValueError: last_id=0
+            self.send_response(200); self.send_header("Content-Type","text/event-stream; charset=utf-8"); self.send_header("Cache-Control","no-cache"); self.send_header("Connection","keep-alive"); self.end_headers()
+            deadline=time.monotonic()+60
+            while time.monotonic()<deadline:
+                con=connect()
+                rows=con.execute("SELECT id,step,kind,detail,created FROM events WHERE run_id=? AND id>? ORDER BY id",(rid,last_id)).fetchall()
+                run=con.execute("SELECT status FROM runs WHERE id=?",(rid,)).fetchone(); con.close()
+                for row in rows:
+                    item=dict(row); last_id=item["id"]
+                    payload=json.dumps(item,ensure_ascii=False)
+                    self.wfile.write(f"id: {last_id}\nevent: {item['kind']}\ndata: {payload}\n\n".encode()); self.wfile.flush()
+                if run is None or (run["status"] in {"done","failed"} and not rows): break
+                time.sleep(.25)
+            return
         if len(parts)==3 and parts[0]=="api" and parts[1]=="runs":
             rid=parts[2]; run=con.execute("SELECT id,status,step,error,created FROM runs WHERE id=?",(rid,)).fetchone(); tasks=[dict(x) for x in con.execute("SELECT title,due_date,done FROM tasks WHERE run_id=?",(rid,))]; con.close(); return self.send_json({"run":dict(run) if run else None,"tasks":tasks},404 if not run else 200)
         con.close(); self.send_json({"error":"not found"},404)
@@ -102,5 +128,5 @@ class Handler(BaseHTTPRequestHandler):
 def main():
     global DB
     ap=argparse.ArgumentParser(); ap.add_argument("--host",default="127.0.0.1"); ap.add_argument("--port",type=int,default=8000); ap.add_argument("--db",type=Path,default=DB); args=ap.parse_args()
-    DB=args.db; connect().close(); print(f"TaskTrail listening on http://{args.host}:{args.port}"); ThreadingHTTPServer((args.host,args.port),Handler).serve_forever()
+    DB=args.db; connect().close(); resume_pending(DB); print(f"TaskTrail listening on http://{args.host}:{args.port}"); ThreadingHTTPServer((args.host,args.port),Handler).serve_forever()
 if __name__=="__main__": main()
